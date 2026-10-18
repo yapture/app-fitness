@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 
 /* -- Types ---------------------------------------------------------------- */
 
@@ -19,6 +19,12 @@ type DayName = 'Mon' | 'Tue' | 'Wed' | 'Thu' | 'Fri' | 'Sat' | 'Sun';
 /* Split colors mapped to token semantics: push=accent, pull=success, legs=warning */
 const SPLIT_C: Record<Split, string> = {
   push: 'var(--yap-accent)',
+  pull: 'var(--yap-success)',
+  legs: 'var(--yap-warning)',
+};
+/* Text colours that meet 4.5:1 on SPLIT_BG / card backgrounds (push: accent fails, so info-fg) */
+const SPLIT_FG: Record<Split, string> = {
+  push: 'var(--yap-info-fg)',
   pull: 'var(--yap-success)',
   legs: 'var(--yap-warning)',
 };
@@ -99,6 +105,24 @@ export function App() {
   const [exercises, setExercises] = useState<Exercise[]>(load);
   const [input, setInput] = useState('');
   const [tab, setTab] = useState<'today' | 'calendar' | 'prs'>('today');
+  const [status, setStatus] = useState('');
+  const flip = useRef(false);
+  const pendingFocus = useRef<{ id: string | null } | null>(null);
+
+  /* Polite live-region message; alternate a trailing nbsp so repeats are re-announced. */
+  const announce = useCallback((msg: string) => {
+    flip.current = !flip.current;
+    setStatus(flip.current ? msg : msg + '\u00a0');
+  }, []);
+
+  /* After a removal, move focus to the next item's control, else the list heading. */
+  useEffect(() => {
+    const p = pendingFocus.current;
+    if (!p) return;
+    pendingFocus.current = null;
+    const el = (p.id && document.querySelector<HTMLElement>(`[data-remove-id="${p.id}"]`)) || document.getElementById('today-heading');
+    el?.focus();
+  }, [exercises]);
 
   const persist = useCallback((n: Exercise[]) => { setExercises(n); save(n); }, []);
 
@@ -106,19 +130,31 @@ export function App() {
     if (!text.trim()) return;
     const p = parse(text);
     persist([{ id: crypto.randomUUID(), ...p, completed: false, createdAt: new Date().toISOString() }, ...exercises]);
-  }, [exercises, persist]);
+    announce(`Added ${p.title}`);
+  }, [exercises, persist, announce]);
 
   const toggle = useCallback((id: string) => {
+    const t = exercises.find(ex => ex.id === id);
     persist(exercises.map(ex => ex.id === id ? { ...ex, completed: !ex.completed } : ex));
-  }, [exercises, persist]);
+    if (t) announce(t.completed ? `Marked ${t.title} incomplete` : `Completed ${t.title}`);
+  }, [exercises, persist, announce]);
 
-  const remove = useCallback((id: string) => { persist(exercises.filter(ex => ex.id !== id)); }, [exercises, persist]);
+  const remove = useCallback((id: string) => {
+    const gone = exercises.find(ex => ex.id === id);
+    const peers = gone?.split ? exercises.filter(ex => ex.split === gone.split) : [];
+    const i = peers.findIndex(ex => ex.id === id);
+    const next = peers[i + 1] ?? peers[i - 1] ?? null;
+    pendingFocus.current = { id: next ? next.id : null };
+    persist(exercises.filter(ex => ex.id !== id));
+    if (gone) announce(`Removed ${gone.title}`);
+  }, [exercises, persist, announce]);
 
   const handleSubmit = (e: FormEvent) => { e.preventDefault(); addExercise(input); setInput(''); };
 
   const loadTemplate = (items: string[]) => {
     const nw = items.map(t => ({ id: crypto.randomUUID(), ...parse(t), completed: false, createdAt: new Date().toISOString() }) as Exercise);
     persist([...nw, ...exercises]);
+    announce(`Added ${nw.length} exercises`);
   };
 
   const splitGroups = useMemo(() => {
@@ -154,17 +190,17 @@ export function App() {
       <div style={S.cardRow}>
         {checkbox && <button type="button" onClick={() => toggle(ex.id)} style={{
           ...S.ckbox, background: ex.completed ? 'var(--yap-success)' : 'var(--yap-border-subtle)',
-          borderColor: ex.completed ? 'var(--yap-success)' : 'var(--yap-border)',
+          borderColor: ex.completed ? 'var(--yap-success)' : 'var(--yap-fg-faint)',
           boxShadow: ex.completed ? 'var(--yap-shadow-xs)' : 'none',
-        }} title={ex.completed ? 'Mark incomplete' : 'Mark completed'}>
+        }} aria-pressed={ex.completed} aria-label={`Completed: ${ex.title}`} title={ex.completed ? 'Mark incomplete' : 'Mark completed'}>
           {ex.completed && <svg width="10" height="8" viewBox="0 0 10 8" fill="none"><path d="M1 3.5L3.5 6L9 1" stroke="#080b10" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
         </button>}
-        <span style={{ ...S.cardTitle, ...(ex.completed ? { textDecoration: 'line-through', opacity: 0.45 } : {}) }}>{ex.title}</span>
-        <button type="button" onClick={() => remove(ex.id)} style={S.removeBtn}>&times;</button>
+        <span style={{ ...S.cardTitle, ...(ex.completed ? { textDecoration: 'line-through', opacity: 0.5 } : {}) }}>{ex.title}</span>
+        <button type="button" onClick={() => remove(ex.id)} style={S.removeBtn} aria-label={`Remove ${ex.title}`} data-remove-id={ex.id}><span aria-hidden="true">&times;</span></button>
       </div>
       <div style={S.badges}>
         {ex.meta && <span style={S.metaBadge}>{metaLabel(ex.meta)}</span>}
-        {ex.split && <span style={{ ...S.badge, background: SPLIT_BG[ex.split], color: SPLIT_C[ex.split] }}>@{ex.split}</span>}
+        {ex.split && <span style={{ ...S.badge, background: SPLIT_BG[ex.split], color: SPLIT_FG[ex.split] }}>@{ex.split}</span>}
         {ex.priority && <span style={{ ...S.badge, ...S.bPri }}>{ex.priority}</span>}
         {ex.routine && <span style={{ ...S.badge, ...S.bRtn }}>~{ex.routine}</span>}
       </div>
@@ -179,7 +215,7 @@ export function App() {
       <div key={day} style={{ ...S.calDay, borderTopColor: bc, ...(isToday ? S.calToday : {}) }}>
         <div style={S.calHead}>
           <span style={{ ...S.calName, ...(isToday ? { color: 'var(--yap-success)' } : {}) }}>{day}</span>
-          <span style={{ ...S.calSplit, ...(rest ? {} : { color: SPLIT_C[ds] }) }}>{rest ? 'rest' : ds}</span>
+          <span style={{ ...S.calSplit, ...(rest ? {} : { color: SPLIT_FG[ds] }) }}>{rest ? 'rest' : ds}</span>
         </div>
         <div style={S.calBody}>
           {rest ? <div style={S.calRest}>Rest Day</div>
@@ -206,7 +242,8 @@ export function App() {
       <main style={S.main}>
         {/* Composer */}
         <form onSubmit={handleSubmit} style={S.form}>
-          <input type="text" value={input} onChange={e => setInput(e.target.value)}
+          <label htmlFor="exercise-input" className="sr-only">Add exercise</label>
+          <input id="exercise-input" type="text" value={input} onChange={e => setInput(e.target.value)}
             placeholder="Add exercise -- try: Bench Press #@push #!high #*{weight:185,reps:8,sets:3}" style={S.input} />
           <button type="submit" disabled={!input.trim()} style={S.addBtn}>Add</button>
         </form>
@@ -214,7 +251,7 @@ export function App() {
         {preview && <div style={S.preview}>
           <span style={S.prevTitle}>{preview.title}</span>
           {preview.meta && <span style={S.metaBadge}>{metaLabel(preview.meta)}</span>}
-          {preview.split && <span style={{ ...S.badge, background: SPLIT_BG[preview.split], color: SPLIT_C[preview.split] }}>@{preview.split}</span>}
+          {preview.split && <span style={{ ...S.badge, background: SPLIT_BG[preview.split], color: SPLIT_FG[preview.split] }}>@{preview.split}</span>}
           {preview.priority && <span style={{ ...S.badge, ...S.bPri }}>{preview.priority}</span>}
           {preview.routine && <span style={{ ...S.badge, ...S.bRtn }}>~{preview.routine}</span>}
         </div>}
@@ -233,7 +270,7 @@ export function App() {
         {/* Tabs */}
         <div style={S.tabBar}>
           {(['today', 'calendar', 'prs'] as const).map(t => (
-            <button key={t} type="button" onClick={() => setTab(t)}
+            <button key={t} type="button" onClick={() => setTab(t)} aria-pressed={tab === t}
               style={{ ...S.tab, ...(tab === t ? S.tabOn : {}) }}>
               {t === 'today' ? "Today's Workout" : t === 'calendar' ? 'Weekly Plan' : 'PR Tracker'}
             </button>
@@ -244,7 +281,7 @@ export function App() {
         {tab === 'today' && <div>
           <div style={S.todayHead}>
             <div>
-              <h2 style={S.todayTitle}>{ts === 'rest' ? 'Rest Day' : `${ts[0].toUpperCase() + ts.slice(1)} Day`}</h2>
+              <h2 id="today-heading" tabIndex={-1} style={S.todayTitle}>{ts === 'rest' ? 'Rest Day' : `${ts[0].toUpperCase() + ts.slice(1)} Day`}</h2>
               <p style={S.todaySub}>{ts === 'rest' ? 'Take it easy -- recovery is growth.' : `${dn} -- ${done}/${todayEx.length} completed`}</p>
             </div>
             {ts !== 'rest' && todayEx.length > 0 && <div style={S.ring}>
@@ -284,6 +321,8 @@ export function App() {
         </div>}
       </main>
 
+      <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">{status}</p>
+
       <footer style={S.footer}>
         <span>Built on{' '}<a href="https://yapture.com" style={S.fLink}>Yapture</a> Script and list primitives</span>
         <span>&middot;</span>
@@ -300,6 +339,8 @@ export function App() {
 const CSS = `
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #080b10; }
+  .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+  input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--yap-ring); outline-offset: 2px; }
   .fitness-calendar { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; }
   @media (max-width: 768px) { .fitness-calendar { grid-template-columns: 1fr !important; } }
 `;
@@ -315,16 +356,16 @@ const S: Record<string, React.CSSProperties> = {
   mLink: { fontSize: 14, color: 'var(--yap-success)', textDecoration: 'none', fontWeight: 500 },
   main: { flex: 1, maxWidth: 1120, margin: '0 auto', padding: '32px 24px', width: '100%', boxSizing: 'border-box' as const },
   form: { display: 'flex', gap: 12, marginBottom: 12 },
-  input: { flex: 1, padding: '12px 16px', borderRadius: 10, border: '1px solid var(--yap-input-border)', background: 'var(--yap-input-bg)', color: 'var(--yap-fg)', fontSize: 15, fontFamily: 'var(--yap-font-mono)', outline: 'none' },
+  input: { flex: 1, padding: '12px 16px', borderRadius: 10, border: '1px solid var(--yap-fg-faint)', background: 'var(--yap-input-bg)', color: 'var(--yap-fg)', fontSize: 15, fontFamily: 'var(--yap-font-mono)' },
   addBtn: { padding: '12px 24px', borderRadius: 10, border: 'none', background: 'var(--yap-success)', color: '#080b10', fontSize: 15, fontWeight: 600, cursor: 'pointer' },
   preview: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 16px', marginBottom: 16, borderRadius: 8, background: 'var(--yap-success-bg)', border: '1px solid var(--yap-success)', fontSize: 14, flexWrap: 'wrap' as const },
   prevTitle: { color: 'var(--yap-fg)', fontWeight: 500 },
   actions: { display: 'flex', flexWrap: 'wrap' as const, gap: 8, marginBottom: 20, alignItems: 'center' },
   tplBtn: { padding: '8px 16px', borderRadius: 8, border: '1px solid var(--yap-border-subtle)', background: 'rgba(255,255,255,.04)', color: 'var(--yap-fg-muted)', fontSize: 13, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 6 },
   tplDot: { display: 'inline-block', width: 8, height: 8, borderRadius: '50%' },
-  count: { marginLeft: 'auto', fontSize: 13, color: 'var(--yap-fg-faint)' },
+  count: { marginLeft: 'auto', fontSize: 13, color: 'var(--yap-fg-muted)' },
   tabBar: { display: 'flex', gap: 4, marginBottom: 24, borderBottom: '1px solid var(--yap-border-subtle)', paddingBottom: 0 },
-  tab: { padding: '10px 20px', borderRadius: '8px 8px 0 0', border: 'none', background: 'transparent', color: 'var(--yap-fg-faint)', fontSize: 14, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', borderBottom: '2px solid transparent', marginBottom: -1 },
+  tab: { padding: '10px 20px', borderRadius: '8px 8px 0 0', border: 'none', background: 'transparent', color: 'var(--yap-fg-muted)', fontSize: 14, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', borderBottom: '2px solid transparent', marginBottom: -1 },
   tabOn: { color: 'var(--yap-success)', borderBottomColor: 'var(--yap-success)', background: 'var(--yap-success-bg)' },
   todayHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 },
   todayTitle: { fontSize: 22, fontWeight: 700, color: 'var(--yap-fg)', margin: 0 },
@@ -336,15 +377,15 @@ const S: Record<string, React.CSSProperties> = {
   cardRow: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 },
   ckbox: { width: 20, height: 20, borderRadius: 5, border: '2px solid', cursor: 'pointer', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background .2s, box-shadow .2s' },
   cardTitle: { flex: 1, fontSize: 15, fontWeight: 500, lineHeight: 1.35 },
-  removeBtn: { border: 'none', background: 'none', color: 'var(--yap-fg-faint)', fontSize: 18, cursor: 'pointer', padding: '0 4px', flexShrink: 0 },
+  removeBtn: { border: 'none', background: 'none', color: 'var(--yap-fg-muted)', fontSize: 18, cursor: 'pointer', padding: '0 4px', flexShrink: 0 },
   badges: { display: 'flex', flexWrap: 'wrap' as const, gap: 5, paddingLeft: 30 },
   badge: { padding: '2px 7px', borderRadius: 5, fontSize: 12, fontWeight: 600, fontFamily: 'var(--yap-font-mono)' },
   metaBadge: { padding: '2px 7px', borderRadius: 5, fontSize: 12, fontWeight: 600, fontFamily: 'var(--yap-font-mono)', background: 'var(--yap-border-subtle)', color: 'var(--yap-fg-muted)' },
   bPri: { background: 'var(--yap-warning-bg)', color: 'var(--yap-warning-fg)' },
-  bRtn: { background: 'var(--yap-accent-muted)', color: 'var(--yap-accent-hover)' },
+  bRtn: { background: 'var(--yap-accent-muted)', color: 'var(--yap-info-fg)' },
   empty: { padding: '40px 20px', textAlign: 'center' as const },
-  emptyTxt: { fontSize: 15, color: 'var(--yap-fg-faint)', marginBottom: 8 },
-  emptyHint: { fontSize: 13, color: 'var(--yap-fg-faint)' },
+  emptyTxt: { fontSize: 15, color: 'var(--yap-fg-muted)', marginBottom: 8 },
+  emptyHint: { fontSize: 13, color: 'var(--yap-fg-muted)' },
   restCard: { padding: 24, borderRadius: 12, background: 'var(--yap-card-bg)', border: '1px solid var(--yap-border)', textAlign: 'center' as const },
   restTxt: { fontSize: 15, color: 'var(--yap-fg-muted)', lineHeight: 1.5 },
   calGrid: {},
@@ -352,20 +393,20 @@ const S: Record<string, React.CSSProperties> = {
   calToday: { background: 'var(--yap-bg-elevated)', boxShadow: 'var(--yap-shadow-xs)' },
   calHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', borderBottom: '1px solid var(--yap-border-subtle)' },
   calName: { fontSize: 13, fontWeight: 700, color: 'var(--yap-fg-muted)', fontFamily: 'var(--yap-font-mono)', textTransform: 'uppercase' as const, letterSpacing: '.05em' },
-  calSplit: { fontSize: 11, fontWeight: 600, color: 'var(--yap-fg-faint)', fontFamily: 'var(--yap-font-mono)', textTransform: 'uppercase' as const },
+  calSplit: { fontSize: 11, fontWeight: 600, color: 'var(--yap-fg-muted)', fontFamily: 'var(--yap-font-mono)', textTransform: 'uppercase' as const },
   calBody: { padding: '8px 10px', display: 'flex', flexDirection: 'column' as const, gap: 6 },
   calEx: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 4 },
   calExN: { fontSize: 13, fontWeight: 500, color: 'var(--yap-fg)', lineHeight: 1.3 },
-  calExM: { fontSize: 11, color: 'var(--yap-fg-faint)', whiteSpace: 'nowrap' as const, fontFamily: 'var(--yap-font-mono)' },
-  calEmpty: { fontSize: 12, color: 'var(--yap-fg-faint)', padding: '8px 0', textAlign: 'center' as const },
-  calRest: { fontSize: 13, color: 'var(--yap-fg-faint)', padding: '16px 0', textAlign: 'center' as const, fontStyle: 'italic' },
+  calExM: { fontSize: 11, color: 'var(--yap-fg-muted)', whiteSpace: 'nowrap' as const, fontFamily: 'var(--yap-font-mono)' },
+  calEmpty: { fontSize: 12, color: 'var(--yap-fg-muted)', padding: '8px 0', textAlign: 'center' as const },
+  calRest: { fontSize: 13, color: 'var(--yap-fg-muted)', padding: '16px 0', textAlign: 'center' as const, fontStyle: 'italic' },
   prHead: { fontSize: 18, fontWeight: 700, color: 'var(--yap-fg)', marginBottom: 20, fontFamily: 'var(--yap-font-mono)' },
   prList: { display: 'flex', flexDirection: 'column' as const, gap: 8 },
   prRow: { display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderRadius: 10, background: 'var(--yap-card-bg)', border: '1px solid var(--yap-border-subtle)', position: 'relative' as const, overflow: 'hidden' },
-  prRank: { fontSize: 13, fontWeight: 700, color: 'var(--yap-fg-faint)', minWidth: 28, fontFamily: 'var(--yap-font-mono)' },
+  prRank: { fontSize: 13, fontWeight: 700, color: 'var(--yap-fg-muted)', minWidth: 28, fontFamily: 'var(--yap-font-mono)' },
   prName: { flex: 1, fontSize: 15, fontWeight: 500, color: 'var(--yap-fg)', textTransform: 'capitalize' as const, zIndex: 1 },
   prWt: { fontSize: 14, fontWeight: 700, color: 'var(--yap-success)', fontFamily: 'var(--yap-font-mono)', zIndex: 1 },
   prBar: { position: 'absolute' as const, left: 0, top: 0, bottom: 0, background: 'var(--yap-success-bg)', opacity: 0.5, transition: 'width .4s ease' },
-  footer: { borderTop: '1px solid var(--yap-border)', padding: '20px 24px', display: 'flex', justifyContent: 'center', gap: 12, fontSize: 13, color: 'var(--yap-fg-faint)' },
-  fLink: { color: 'var(--yap-success)', textDecoration: 'none' },
+  footer: { borderTop: '1px solid var(--yap-border)', padding: '20px 24px', display: 'flex', justifyContent: 'center', gap: 12, fontSize: 13, color: 'var(--yap-fg-muted)' },
+  fLink: { color: 'var(--yap-success)', textDecoration: 'underline' },
 };
