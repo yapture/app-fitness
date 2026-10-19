@@ -1,15 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { createBackup, MAX_BACKUP_BYTES, parseBackup, type Exercise, type ExerciseMeta } from './backup';
 
 /* -- Types ---------------------------------------------------------------- */
-
-interface ExerciseMeta { weight: number; reps: number; sets: number }
-
-interface Exercise {
-  id: string; raw: string; title: string;
-  split: 'push' | 'pull' | 'legs' | null;
-  routine: string | null; priority: string | null;
-  meta: ExerciseMeta | null; completed: boolean; createdAt: string;
-}
 
 type Split = 'push' | 'pull' | 'legs';
 type DayName = 'Mon' | 'Tue' | 'Wed' | 'Thu' | 'Fri' | 'Sat' | 'Sun';
@@ -143,6 +135,8 @@ export function App() {
   const [tab, setTab] = useState<'today' | 'calendar' | 'prs'>('today');
   const [status, setStatus] = useState('');
   const [storageWarning, setStorageWarning] = useState(false);
+  const [backupFeedback, setBackupFeedback] = useState('');
+  const backupInput = useRef<HTMLInputElement>(null);
   const flip = useRef(false);
   const pendingFocus = useRef<{ id: string | null } | null>(null);
 
@@ -157,8 +151,12 @@ export function App() {
     const p = pendingFocus.current;
     if (!p) return;
     pendingFocus.current = null;
-    const el = (p.id && document.querySelector<HTMLElement>(`[data-remove-id="${p.id}"]`)) || document.getElementById('today-heading');
-    el?.focus();
+    let target: HTMLElement | null = null;
+    if (p.id) {
+      try { target = document.querySelector<HTMLElement>(`[data-remove-id="${CSS.escape(p.id)}"]`); }
+      catch { /* A restored record ID may not be valid CSS selector syntax. */ }
+    }
+    (target || document.getElementById('today-heading'))?.focus();
   }, [exercises]);
 
   const persist = useCallback((n: Exercise[]) => {
@@ -196,6 +194,52 @@ export function App() {
     persist([...nw, ...exercises]);
     announce(`Added ${nw.length} exercises`);
   };
+
+  const downloadBackup = useCallback(() => {
+    try {
+      const blob = new Blob([createBackup(exercises)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `fitness-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.append(link);
+      try { link.click(); }
+      finally { link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60_000); }
+      setBackupFeedback('Backup download started. Keep the JSON file somewhere safe.');
+      announce('Backup download started');
+    } catch {
+      setBackupFeedback('Could not create backup.');
+      announce('Could not create backup');
+    }
+  }, [exercises, announce]);
+
+  const restoreBackup = useCallback(async (file: File | undefined) => {
+    if (!file) return;
+    setBackupFeedback('');
+    try {
+      if (file.size > MAX_BACKUP_BYTES) throw new Error('Backup exceeds 1 MiB');
+      const backup = parseBackup(await file.text());
+      if (exercises.length || load().length) {
+        throw new Error('Restore requires an empty workout. Download a backup of this workout first.');
+      }
+      const exercisesBeforeConfirm = localStorage.getItem(STORAGE_KEY);
+      if (!window.confirm(`Restore ${backup.exercises.length} exercises?`)) return;
+      if (localStorage.getItem(STORAGE_KEY) !== exercisesBeforeConfirm || load().length) {
+        throw new Error('Workout changed in another tab. Reload before restoring.');
+      }
+      // save refuses malformed existing storage, including data hidden by load().
+      if (!save(backup.exercises)) throw new Error('Could not save restored exercises');
+      setExercises(backup.exercises);
+      setBackupFeedback(`Restored ${backup.exercises.length} exercises.`);
+      announce(`Restored ${backup.exercises.length} exercises`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not restore backup';
+      setBackupFeedback(message);
+      announce(message);
+    } finally {
+      if (backupInput.current) backupInput.current.value = '';
+    }
+  }, [exercises, announce]);
 
   const splitGroups = useMemo(() => {
     const g: Record<Split, Exercise[]> = { push: [], pull: [], legs: [] };
@@ -307,6 +351,13 @@ export function App() {
             <span style={{ ...S.tplDot, background: SPLIT_C.legs }} />Leg Day</button>
           <span style={S.count}>{exercises.length} exercise{exercises.length !== 1 ? 's' : ''}</span>
         </div>
+        <div style={S.actions}>
+          <button type="button" onClick={downloadBackup} style={S.tplBtn}>Download backup</button>
+          <input ref={backupInput} type="file" accept="application/json,.json" className="sr-only"
+            aria-label="Choose Fitness backup" onChange={(e) => { void restoreBackup(e.target.files?.[0]); }} />
+          <button type="button" onClick={() => backupInput.current?.click()} style={S.tplBtn}>Restore backup</button>
+        </div>
+        {backupFeedback && <p role="alert">{backupFeedback}</p>}
 
         {/* Tabs */}
         <div style={S.tabBar}>
