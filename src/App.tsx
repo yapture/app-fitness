@@ -41,10 +41,46 @@ const STORAGE_KEY = 'yapture.app-fitness.exercises.v1';
 
 /* -- Persistence ---------------------------------------------------------- */
 
-function load(): Exercise[] {
-  try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : []; } catch { return []; }
+function isExercise(value: unknown): value is Exercise {
+  if (!value || typeof value !== 'object') return false;
+  const exercise = value as Record<string, unknown>;
+  const nullableString = (field: string) => exercise[field] === null || typeof exercise[field] === 'string';
+  const meta = exercise.meta;
+  const validMeta = meta === null || (typeof meta === 'object' && meta !== null
+    && ['weight', 'reps', 'sets'].every((field) => {
+      const amount = (meta as Record<string, unknown>)[field];
+      return typeof amount === 'number' && Number.isFinite(amount) && amount >= 0;
+    }));
+  return typeof exercise.id === 'string'
+    && typeof exercise.raw === 'string'
+    && typeof exercise.title === 'string'
+    && typeof exercise.createdAt === 'string'
+    && (exercise.split === null || exercise.split === 'push' || exercise.split === 'pull' || exercise.split === 'legs')
+    && nullableString('routine')
+    && nullableString('priority')
+    && typeof exercise.completed === 'boolean'
+    && validMeta;
 }
-function save(items: Exercise[]) { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); }
+
+export function load(): Exercise[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(isExercise) : [];
+  } catch { return []; }
+}
+export function save(items: Exercise[]): boolean {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw !== null) {
+      const prior: unknown = JSON.parse(raw);
+      if (!Array.isArray(prior) || !prior.every(isExercise)) return false;
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    return true;
+  } catch { return false; }
+}
 
 /* -- Parser --------------------------------------------------------------- */
 
@@ -106,6 +142,7 @@ export function App() {
   const [input, setInput] = useState('');
   const [tab, setTab] = useState<'today' | 'calendar' | 'prs'>('today');
   const [status, setStatus] = useState('');
+  const [storageWarning, setStorageWarning] = useState(false);
   const flip = useRef(false);
   const pendingFocus = useRef<{ id: string | null } | null>(null);
 
@@ -124,7 +161,10 @@ export function App() {
     el?.focus();
   }, [exercises]);
 
-  const persist = useCallback((n: Exercise[]) => { setExercises(n); save(n); }, []);
+  const persist = useCallback((n: Exercise[]) => {
+    setExercises(n);
+    if (!save(n)) setStorageWarning(true);
+  }, []);
 
   const addExercise = useCallback((text: string) => {
     if (!text.trim()) return;
@@ -240,6 +280,7 @@ export function App() {
       </div></header>
 
       <main style={S.main}>
+        {storageWarning && <p role="alert">Changes could not be saved. They may disappear when you reload this page.</p>}
         {/* Composer */}
         <form onSubmit={handleSubmit} style={S.form}>
           <label htmlFor="exercise-input" className="sr-only">Add exercise</label>
