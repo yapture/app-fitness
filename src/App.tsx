@@ -1,15 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { BoardStore } from './board-store';
+import { createBackup, isExercise, MAX_BACKUP_BYTES, parseBackup, type Exercise, type ExerciseMeta } from './backup';
 
 /* -- Types ---------------------------------------------------------------- */
 
-interface ExerciseMeta { weight: number; reps: number; sets: number }
-
-interface Exercise {
-  id: string; raw: string; title: string;
-  split: 'push' | 'pull' | 'legs' | null;
-  routine: string | null; priority: string | null;
-  meta: ExerciseMeta | null; completed: boolean; createdAt: string;
-}
+export type { Exercise } from './backup';
 
 type Split = 'push' | 'pull' | 'legs';
 type DayName = 'Mon' | 'Tue' | 'Wed' | 'Thu' | 'Fri' | 'Sat' | 'Sun';
@@ -40,27 +35,6 @@ const DAY_SPLIT: Record<DayName, Split | 'rest'> = {
 const STORAGE_KEY = 'yapture.app-fitness.exercises.v1';
 
 /* -- Persistence ---------------------------------------------------------- */
-
-function isExercise(value: unknown): value is Exercise {
-  if (!value || typeof value !== 'object') return false;
-  const exercise = value as Record<string, unknown>;
-  const nullableString = (field: string) => exercise[field] === null || typeof exercise[field] === 'string';
-  const meta = exercise.meta;
-  const validMeta = meta === null || (typeof meta === 'object' && meta !== null
-    && ['weight', 'reps', 'sets'].every((field) => {
-      const amount = (meta as Record<string, unknown>)[field];
-      return typeof amount === 'number' && Number.isFinite(amount) && amount >= 0;
-    }));
-  return typeof exercise.id === 'string'
-    && typeof exercise.raw === 'string'
-    && typeof exercise.title === 'string'
-    && typeof exercise.createdAt === 'string'
-    && (exercise.split === null || exercise.split === 'push' || exercise.split === 'pull' || exercise.split === 'legs')
-    && nullableString('routine')
-    && nullableString('priority')
-    && typeof exercise.completed === 'boolean'
-    && validMeta;
-}
 
 export function load(): Exercise[] {
   try {
@@ -138,13 +112,57 @@ function todayName(): DayName {
 /* -- Component ------------------------------------------------------------ */
 
 export function App() {
-  const [exercises, setExercises] = useState<Exercise[]>(load);
+  const [exercises, setExercises] = useState<Exercise[]>([]);
   const [input, setInput] = useState('');
   const [tab, setTab] = useState<'today' | 'calendar' | 'prs'>('today');
   const [status, setStatus] = useState('');
   const [storageWarning, setStorageWarning] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [conflict, setConflict] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [recoveryFeedback, setRecoveryFeedback] = useState('');
+  const [backupFeedback, setBackupFeedback] = useState('');
+  const backupInput = useRef<HTMLInputElement>(null);
+  const storeRef = useRef<BoardStore | null>(null);
+  const revisionRef = useRef<number | null>(null);
+  const boardRef = useRef<Exercise[]>([]);
+  const conflictRef = useRef(false);
+  const legacyWriteRef = useRef(false);
+  const savingRef = useRef(false);
   const flip = useRef(false);
   const pendingFocus = useRef<{ id: string | null } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let opened: BoardStore | null = null;
+    let opening: ReturnType<typeof BoardStore.open>;
+    try { opening = BoardStore.open(indexedDB, () => localStorage); }
+    catch { setLoadError(true); return; }
+    void opening.then(({ store, board, legacyChanged }) => {
+      if (cancelled) { store.close(); return; }
+      opened = store;
+      storeRef.current = store;
+      revisionRef.current = board.revision;
+      boardRef.current = board.exercises;
+      setExercises(board.exercises);
+      if (legacyChanged) { legacyWriteRef.current = true; setStorageWarning(true); }
+      setReady(true);
+    }).catch(() => { if (!cancelled) setLoadError(true); });
+    return () => {
+      cancelled = true;
+      opened?.close();
+      if (storeRef.current === opened) storeRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const onLegacyWrite = (event: StorageEvent) => {
+      if (event.key === STORAGE_KEY) { legacyWriteRef.current = true; setStorageWarning(true); }
+    };
+    window.addEventListener('storage', onLegacyWrite);
+    return () => window.removeEventListener('storage', onLegacyWrite);
+  }, []);
 
   /* Polite live-region message; alternate a trailing nbsp so repeats are re-announced. */
   const announce = useCallback((msg: string) => {
@@ -157,44 +175,158 @@ export function App() {
     const p = pendingFocus.current;
     if (!p) return;
     pendingFocus.current = null;
-    const el = (p.id && document.querySelector<HTMLElement>(`[data-remove-id="${p.id}"]`)) || document.getElementById('today-heading');
+    const el = (p.id && Array.from(document.querySelectorAll<HTMLElement>('[data-remove-id]'))
+      .find((candidate) => candidate.dataset.removeId === p.id)) || document.getElementById('today-heading');
     el?.focus();
   }, [exercises]);
 
-  const persist = useCallback((n: Exercise[]) => {
-    setExercises(n);
-    if (!save(n)) setStorageWarning(true);
+  const persist = useCallback(async (next: Exercise[]): Promise<boolean> => {
+    if (conflictRef.current || savingRef.current || !storeRef.current || revisionRef.current === null) return false;
+    if (legacyWriteRef.current) {
+      conflictRef.current = true;
+      setExercises(next);
+      setConflict(true);
+      setStorageWarning(true);
+      return false;
+    }
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      const result = await storeRef.current.commit(revisionRef.current, next);
+      if (result.state === 'saved') {
+        revisionRef.current = result.revision;
+        boardRef.current = next;
+        setExercises(next);
+        return true;
+      }
+    } catch { /* Keep the attempted collection available for export. */ }
+    finally { savingRef.current = false; setSaving(false); }
+    setExercises(next);
+    conflictRef.current = true;
+    setConflict(true);
+    setStorageWarning(true);
+    return false;
   }, []);
 
-  const addExercise = useCallback((text: string) => {
+  const addExercise = useCallback(async (text: string) => {
     if (!text.trim()) return;
     const p = parse(text);
-    persist([{ id: crypto.randomUUID(), ...p, completed: false, createdAt: new Date().toISOString() }, ...exercises]);
+    if (!(await persist([{ id: crypto.randomUUID(), ...p, completed: false, createdAt: new Date().toISOString() }, ...exercises]))) return;
+    setInput('');
     announce(`Added ${p.title}`);
   }, [exercises, persist, announce]);
 
-  const toggle = useCallback((id: string) => {
+  const toggle = useCallback(async (id: string) => {
     const t = exercises.find(ex => ex.id === id);
-    persist(exercises.map(ex => ex.id === id ? { ...ex, completed: !ex.completed } : ex));
+    if (!t || !(await persist(exercises.map(ex => ex.id === id ? { ...ex, completed: !ex.completed } : ex)))) return;
     if (t) announce(t.completed ? `Marked ${t.title} incomplete` : `Completed ${t.title}`);
   }, [exercises, persist, announce]);
 
-  const remove = useCallback((id: string) => {
+  const remove = useCallback(async (id: string) => {
     const gone = exercises.find(ex => ex.id === id);
     const peers = gone?.split ? exercises.filter(ex => ex.split === gone.split) : [];
     const i = peers.findIndex(ex => ex.id === id);
     const next = peers[i + 1] ?? peers[i - 1] ?? null;
     pendingFocus.current = { id: next ? next.id : null };
-    persist(exercises.filter(ex => ex.id !== id));
+    if (!(await persist(exercises.filter(ex => ex.id !== id)))) return;
     if (gone) announce(`Removed ${gone.title}`);
   }, [exercises, persist, announce]);
 
-  const handleSubmit = (e: FormEvent) => { e.preventDefault(); addExercise(input); setInput(''); };
+  const handleSubmit = (e: FormEvent) => { e.preventDefault(); void addExercise(input); };
 
-  const loadTemplate = (items: string[]) => {
+  const loadTemplate = async (items: string[]) => {
     const nw = items.map(t => ({ id: crypto.randomUUID(), ...parse(t), completed: false, createdAt: new Date().toISOString() }) as Exercise);
-    persist([...nw, ...exercises]);
+    if (!(await persist([...nw, ...exercises]))) return;
     announce(`Added ${nw.length} exercises`);
+  };
+
+  const downloadBackup = useCallback(() => {
+    try {
+      const url = URL.createObjectURL(new Blob([createBackup(exercises)], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `fitness-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.append(link);
+      try { link.click(); }
+      finally { link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60_000); }
+      setBackupFeedback('Backup download started. Keep the JSON file somewhere safe.');
+      announce('Backup download started');
+    } catch {
+      setBackupFeedback('Could not create backup.');
+      announce('Could not create backup');
+    }
+  }, [exercises, announce]);
+
+  const restoreBackup = useCallback(async (file: File | undefined) => {
+    if (!file) return;
+    setBackupFeedback('');
+    try {
+      if (file.size > MAX_BACKUP_BYTES) throw new Error('Backup exceeds 1 MiB');
+      const backup = parseBackup(await file.text());
+      const revision = revisionRef.current;
+      if (revision === null || boardRef.current.length || conflictRef.current || savingRef.current || legacyWriteRef.current) {
+        throw new Error('Restore requires an empty, unchanged workout. Download a backup and reload before restoring.');
+      }
+      const legacyBeforeConfirm = localStorage.getItem(STORAGE_KEY);
+      if (!window.confirm(`Restore ${backup.exercises.length} exercises?`)) return;
+      if (revisionRef.current !== revision || boardRef.current.length || conflictRef.current
+        || savingRef.current || legacyWriteRef.current || localStorage.getItem(STORAGE_KEY) !== legacyBeforeConfirm) {
+        throw new Error('Workout changed in another tab. Reload before restoring.');
+      }
+      // One version-checked database transaction restores the entire workout.
+      if (!(await persist(backup.exercises))) {
+        throw new Error('Restore conflicted or storage failed. Download the unsaved JSON before reloading.');
+      }
+      setBackupFeedback(`Restored ${backup.exercises.length} exercises.`);
+      announce(`Restored ${backup.exercises.length} exercises`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not restore backup';
+      setBackupFeedback(message);
+      announce(message);
+    } finally {
+      if (backupInput.current) backupInput.current.value = '';
+    }
+  }, [persist, announce]);
+
+  const downloadRecovery = useCallback(() => {
+    try {
+      const data = JSON.stringify({
+        app: 'yapture-fitness', schemaVersion: 1,
+        exportedAt: new Date().toISOString(), exercises,
+      }, null, 2);
+      const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `fitness-unsaved-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.append(link);
+      try { link.click(); }
+      finally { link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60_000); }
+      setRecoveryFeedback('Unsaved Fitness JSON download started. Keep it before reloading.');
+      announce('Unsaved Fitness download started');
+    } catch {
+      setRecoveryFeedback('Could not download unsaved data. Keep this tab open.');
+      announce('Could not download unsaved data');
+    }
+  }, [exercises, announce]);
+
+  const downloadLegacyRecovery = () => {
+    try {
+      const data = JSON.stringify({
+        app: 'yapture-fitness', schemaVersion: 1,
+        exportedAt: new Date().toISOString(),
+        legacyExercisesRaw: localStorage.getItem(STORAGE_KEY),
+      }, null, 2);
+      const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `fitness-legacy-recovery-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.append(link);
+      try { link.click(); }
+      finally { link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60_000); }
+      setRecoveryFeedback('Original browser data download started. Keep it before changing this browser.');
+    } catch {
+      setRecoveryFeedback('Browser storage could not be read. Keep this tab and browser profile intact.');
+    }
   };
 
   const splitGroups = useMemo(() => {
@@ -228,7 +360,7 @@ export function App() {
   const renderCard = (ex: Exercise, checkbox: boolean) => (
     <div key={ex.id} style={S.card}>
       <div style={S.cardRow}>
-        {checkbox && <button type="button" onClick={() => toggle(ex.id)} style={{
+        {checkbox && <button type="button" disabled={conflict || saving} onClick={() => { void toggle(ex.id); }} style={{
           ...S.ckbox, background: ex.completed ? 'var(--yap-success)' : 'var(--yap-border-subtle)',
           borderColor: ex.completed ? 'var(--yap-success)' : 'var(--yap-fg-faint)',
           boxShadow: ex.completed ? 'var(--yap-shadow-xs)' : 'none',
@@ -236,7 +368,7 @@ export function App() {
           {ex.completed && <svg width="10" height="8" viewBox="0 0 10 8" fill="none"><path d="M1 3.5L3.5 6L9 1" stroke="#080b10" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
         </button>}
         <span style={{ ...S.cardTitle, ...(ex.completed ? { textDecoration: 'line-through', opacity: 0.5 } : {}) }}>{ex.title}</span>
-        <button type="button" onClick={() => remove(ex.id)} style={S.removeBtn} aria-label={`Remove ${ex.title}`} data-remove-id={ex.id}><span aria-hidden="true">&times;</span></button>
+        <button type="button" disabled={conflict || saving} onClick={() => { void remove(ex.id); }} style={S.removeBtn} aria-label={`Remove ${ex.title}`} data-remove-id={ex.id}><span aria-hidden="true">&times;</span></button>
       </div>
       <div style={S.badges}>
         {ex.meta && <span style={S.metaBadge}>{metaLabel(ex.meta)}</span>}
@@ -271,6 +403,13 @@ export function App() {
     );
   };
 
+  if (loadError) return <main role="alert">
+    <p>Fitness storage could not be opened. Your older browser data was left untouched. Close older tabs and reload after saving a recovery copy.</p>
+    <button type="button" onClick={downloadLegacyRecovery}>Download original browser data</button>
+    {recoveryFeedback && <p role="status">{recoveryFeedback}</p>}
+  </main>;
+  if (!ready) return <main role="status">Loading Fitness…</main>;
+
   return (
     <div style={S.root}>
       <style>{CSS}</style>
@@ -280,13 +419,18 @@ export function App() {
       </div></header>
 
       <main style={S.main}>
-        {storageWarning && <p role="alert">Changes could not be saved. They may disappear when you reload this page.</p>}
+        {storageWarning && <p role="alert">{conflict
+          ? 'Another tab changed this workout or storage failed. This tab holds unsaved data. Download its JSON before reloading.'
+          : 'Older browser storage changed or cannot be read. This tab is read-only. Download the current backup and, if available, the original browser data before resolving the copies.'}</p>}
+        {storageWarning && <button type="button" onClick={downloadLegacyRecovery} style={S.tplBtn}>Download original browser data</button>}
+        {conflict && <button type="button" onClick={downloadRecovery} style={S.tplBtn}>Download unsaved JSON</button>}
+        {storageWarning && recoveryFeedback && <p role="status">{recoveryFeedback}</p>}
         {/* Composer */}
         <form onSubmit={handleSubmit} style={S.form}>
           <label htmlFor="exercise-input" className="sr-only">Add exercise</label>
           <input id="exercise-input" type="text" value={input} onChange={e => setInput(e.target.value)}
             placeholder="Add exercise -- try: Bench Press #@push #!high #*{weight:185,reps:8,sets:3}" style={S.input} />
-          <button type="submit" disabled={!input.trim()} style={S.addBtn}>Add</button>
+          <button type="submit" disabled={conflict || saving || !input.trim()} style={S.addBtn}>Add</button>
         </form>
 
         {preview && <div style={S.preview}>
@@ -299,14 +443,21 @@ export function App() {
 
         {/* Template buttons */}
         <div style={S.actions}>
-          <button type="button" onClick={() => loadTemplate(PUSH_EX)} style={S.tplBtn}>
+          <button type="button" disabled={conflict || saving} onClick={() => { void loadTemplate(PUSH_EX); }} style={S.tplBtn}>
             <span style={{ ...S.tplDot, background: SPLIT_C.push }} />Push Day</button>
-          <button type="button" onClick={() => loadTemplate(PULL_EX)} style={S.tplBtn}>
+          <button type="button" disabled={conflict || saving} onClick={() => { void loadTemplate(PULL_EX); }} style={S.tplBtn}>
             <span style={{ ...S.tplDot, background: SPLIT_C.pull }} />Pull Day</button>
-          <button type="button" onClick={() => loadTemplate(LEG_EX)} style={S.tplBtn}>
+          <button type="button" disabled={conflict || saving} onClick={() => { void loadTemplate(LEG_EX); }} style={S.tplBtn}>
             <span style={{ ...S.tplDot, background: SPLIT_C.legs }} />Leg Day</button>
           <span style={S.count}>{exercises.length} exercise{exercises.length !== 1 ? 's' : ''}</span>
         </div>
+        <div style={S.actions}>
+          <button type="button" onClick={downloadBackup} style={S.tplBtn}>Download backup</button>
+          <input ref={backupInput} type="file" accept="application/json,.json" className="sr-only"
+            aria-label="Choose Fitness backup" onChange={(e) => { void restoreBackup(e.target.files?.[0]); }} />
+          <button type="button" disabled={conflict || saving} onClick={() => backupInput.current?.click()} style={S.tplBtn}>Restore backup</button>
+        </div>
+        {backupFeedback && <p role="alert">{backupFeedback}</p>}
 
         {/* Tabs */}
         <div style={S.tabBar}>
