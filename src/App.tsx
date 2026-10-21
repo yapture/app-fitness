@@ -58,14 +58,23 @@ export function save(items: Exercise[]): boolean {
 
 /* -- Parser --------------------------------------------------------------- */
 
-function parse(text: string): Omit<Exercise, 'id' | 'completed' | 'createdAt'> {
+const NUMERIC_INPUT_ERROR = 'Use finite numbers of zero or more for weight, reps and sets.';
+
+export function parseExercise(text: string): Omit<Exercise, 'id' | 'completed' | 'createdAt'> | null {
+  if (!text.trim()) return null;
   let split: Exercise['split'] = null, routine: string | null = null,
       priority: string | null = null, meta: ExerciseMeta | null = null;
 
   const mm = text.match(/#\*\{([^}]*)}/);
   if (mm) {
-    const o: Record<string, number> = {};
-    for (const p of mm[1].split(',')) { const [k, v] = p.split(':').map(s => s.trim()); if (k && v) o[k] = Number(v); }
+    const o: Partial<ExerciseMeta> = {};
+    for (const p of mm[1].split(',')) {
+      const [k, v, ...extra] = p.split(':').map(s => s.trim());
+      if (k !== 'weight' && k !== 'reps' && k !== 'sets') continue;
+      const amount = Number(v);
+      if (!v || extra.length || !Number.isFinite(amount) || amount < 0) return null;
+      o[k] = amount;
+    }
     if (o.weight || o.reps || o.sets) meta = { weight: o.weight || 0, reps: o.reps || 0, sets: o.sets || 0 };
   }
 
@@ -175,7 +184,7 @@ export function App() {
     const p = pendingFocus.current;
     if (!p) return;
     pendingFocus.current = null;
-    const el = (p.id && Array.from(document.querySelectorAll<HTMLElement>('[data-remove-id]'))
+    const el = (p.id !== null && Array.from(document.querySelectorAll<HTMLElement>('[data-remove-id]'))
       .find((candidate) => candidate.dataset.removeId === p.id)) || document.getElementById('today-heading');
     el?.focus();
   }, [exercises]);
@@ -210,7 +219,8 @@ export function App() {
 
   const addExercise = useCallback(async (text: string) => {
     if (!text.trim()) return;
-    const p = parse(text);
+    const p = parseExercise(text);
+    if (!p) { announce(NUMERIC_INPUT_ERROR); return; }
     if (!(await persist([{ id: crypto.randomUUID(), ...p, completed: false, createdAt: new Date().toISOString() }, ...exercises]))) return;
     setInput('');
     announce(`Added ${p.title}`);
@@ -235,7 +245,12 @@ export function App() {
   const handleSubmit = (e: FormEvent) => { e.preventDefault(); void addExercise(input); };
 
   const loadTemplate = async (items: string[]) => {
-    const nw = items.map(t => ({ id: crypto.randomUUID(), ...parse(t), completed: false, createdAt: new Date().toISOString() }) as Exercise);
+    const nw: Exercise[] = [];
+    for (const text of items) {
+      const parsed = parseExercise(text);
+      if (!parsed) { announce(NUMERIC_INPUT_ERROR); return; }
+      nw.push({ id: crypto.randomUUID(), ...parsed, completed: false, createdAt: new Date().toISOString() });
+    }
     if (!(await persist([...nw, ...exercises]))) return;
     announce(`Added ${nw.length} exercises`);
   };
@@ -351,7 +366,8 @@ export function App() {
     return Array.from(best.entries()).map(([name, weight]) => ({ name, weight })).sort((a, b) => b.weight - a.weight);
   }, [exercises]);
 
-  const preview = useMemo(() => input.trim() ? parse(input) : null, [input]);
+  const preview = useMemo(() => input.trim() ? parseExercise(input) : null, [input]);
+  const inputError = input.trim() && !preview ? NUMERIC_INPUT_ERROR : null;
 
   /* -- Render helpers ----------------------------------------------------- */
 
@@ -429,9 +445,11 @@ export function App() {
         <form onSubmit={handleSubmit} style={S.form}>
           <label htmlFor="exercise-input" className="sr-only">Add exercise</label>
           <input id="exercise-input" type="text" value={input} onChange={e => setInput(e.target.value)}
+            aria-invalid={!!inputError} aria-describedby={inputError ? 'exercise-input-error' : undefined}
             placeholder="Add exercise -- try: Bench Press #@push #!high #*{weight:185,reps:8,sets:3}" style={S.input} />
-          <button type="submit" disabled={conflict || saving || !input.trim()} style={S.addBtn}>Add</button>
+          <button type="submit" disabled={conflict || saving || !input.trim() || !!inputError} style={S.addBtn}>Add</button>
         </form>
+        {inputError && <p id="exercise-input-error" role="alert">{inputError}</p>}
 
         {preview && <div style={S.preview}>
           <span style={S.prevTitle}>{preview.title}</span>
